@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -28,6 +29,43 @@ import (
 	sdkresource "github.com/bpg/terraform-provider-proxmox/proxmoxtf/resource"
 	"github.com/bpg/terraform-provider-proxmox/utils"
 )
+
+// diskFormatForVolumeID derives a disk's format from its Proxmox volume ID,
+// matching how pve-storage reports it per storage plugin: a known filename
+// extension is the format (.qcow2/.raw/.vmdk), and an extension-less disk name is
+// raw. File plugins parse the extension (Plugin::parse_name_dir); block plugins
+// return raw for an extension-less vm-/base- name but still honor a .qcow2 suffix
+// (e.g. LVMPlugin: `$volname =~ /\.qcow2$/ ? 'qcow2' : 'raw'`), which the
+// extension-first rule here handles correctly. We map the formats the schema
+// accepts (qcow2/raw/vmdk) and return ("", false) for an unrecognized or empty/
+// malformed volume ID. The function never errors or panics, so the caller (which
+// invokes it from an error path) needs no nested error handling.
+// Ref: PVE::Storage::{Plugin,LVMPlugin,ZFSPoolPlugin,RBDPlugin}::parse_volname.
+func diskFormatForVolumeID(volumeID string) (string, bool) {
+	// Strip the "<storage>:" prefix to get the volume name parse_volname parses.
+	volname := volumeID
+	if _, after, found := strings.Cut(volumeID, ":"); found {
+		volname = after
+	}
+
+	// A degenerate volume ID (e.g. "storage:" or "") has no volume name; it is not a
+	// valid block volume, so report unknown rather than assuming raw and let the caller
+	// surface the original read error.
+	if volname == "" {
+		return "", false
+	}
+
+	switch ext := strings.ToLower(strings.TrimPrefix(path.Ext(volname), ".")); ext {
+	case "qcow2", "raw", "vmdk":
+		// File-based volume: the extension is the format.
+		return ext, true
+	case "":
+		// Block-based volume (no extension) is always raw.
+		return "raw", true
+	default:
+		return "", false
+	}
+}
 
 // GetDiskInfoWithFileID returns the disk information for a VM.
 //
@@ -425,8 +463,12 @@ func Read(
 
 		if dd.Format == nil {
 			if datastoreID != "" {
-				// disk format may not be returned by config API if it is default for the storage, and that may be different
-				// from the default qcow2, so we need to read it from the storage API to make sure we have the correct value
+				// PVE omits a disk's format from the VM config when it equals the storage default
+				// (always the case on block storage), so it has to be recovered from the storage.
+				// Prefer the authoritative content endpoint; only when the token lacks VM.Config.Disk
+				// on the owning VM (a read-only/plan token, which gets a 403) fall back to deriving
+				// the format from the volume ID. This leaves full-privilege refresh unchanged and only
+				// adds a path for the otherwise-fatal permission error.
 				volume, e := client.Node(nodeName).Storage(datastoreID).GetDatastoreFile(ctx, dd.FileVolume)
 
 				switch {
@@ -437,6 +479,20 @@ func Read(
 						"datastore": datastoreID,
 						"volume":    dd.FileVolume,
 					})
+				case errors.Is(e, api.ErrPermissionDenied):
+					// The token cannot read the volume (needs VM.Config.Disk on /vms/<id>). Derive the
+					// format from the volume ID instead; if its shape is unrecognized, surface the error.
+					if format, ok := diskFormatForVolumeID(dd.FileVolume); ok {
+						tflog.Debug(ctx, "deriving disk format from volume ID; token lacks VM.Config.Disk on the VM", map[string]any{
+							"datastore": datastoreID,
+							"volume":    dd.FileVolume,
+							"format":    format,
+						})
+						disk[mkDiskFileFormat] = format
+					} else {
+						diags = append(diags, diag.FromErr(e)...)
+						continue
+					}
 				case e != nil:
 					diags = append(diags, diag.FromErr(e)...)
 					continue

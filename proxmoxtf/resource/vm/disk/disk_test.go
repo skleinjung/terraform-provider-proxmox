@@ -1053,3 +1053,112 @@ func TestDiskQueuesSettings(t *testing.T) {
 	_, err = GetDiskDeviceObjects(resourceData, resource, virtioDiskList)
 	require.ErrorContains(t, err, "queues are only supported for SCSI disks")
 }
+
+// TestDiskFormatForVolumeID verifies that a disk's format is derived from its
+// volume ID — the filename extension for file-based volumes, or "raw" for
+// extension-less block volumes — and ("", false) for an unrecognized extension.
+// Read uses this to recover the format when the authoritative content lookup is
+// forbidden (HTTP 403). Mirrors pve-storage's parse_volname.
+func TestDiskFormatForVolumeID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		volumeID   string
+		wantFormat string
+		wantOK     bool
+	}{
+		// Cases mirror pve-storage's per-plugin parse_volname; see
+		// https://github.com/proxmox/pve-storage/tree/master/src/PVE/Storage
+		//
+		// Block-based volumes have no extension and are always raw
+		// (LVMPlugin/LvmThinPlugin/ZFSPoolPlugin/RBDPlugin::parse_volname).
+		{"lvm-thin", "local-lvm:vm-100-disk-0", "raw", true},
+		{"zfspool", "local-zfs:vm-100-disk-1", "raw", true},
+		{"rbd", "ceph:vm-100-disk-0", "raw", true},
+		{"block template base", "local-lvm:base-9000-disk-0", "raw", true},
+		// A .qcow2 suffix is the format even on block storage (qcow2-on-LVM), which a
+		// storage-type heuristic would wrongly report as raw
+		// (LVMPlugin::parse_volname: `$volname =~ /\.qcow2$/ ? 'qcow2' : 'raw'`).
+		{"lvm qcow2", "local-lvm:vm-100-disk-0.qcow2", "qcow2", true},
+		// File-based volumes encode the format as the filename extension
+		// (Plugin::parse_name_dir: `\.(raw|qcow2|vmdk|subvol)$`).
+		{"dir qcow2", "local:100/vm-100-disk-0.qcow2", "qcow2", true},
+		{"nfs raw", "nfs:100/vm-100-disk-0.raw", "raw", true},
+		{"vmdk", "store:100/vm-100-disk-0.vmdk", "vmdk", true},
+		{"file template base qcow2", "local:9000/base-9000-disk-0.qcow2", "qcow2", true},
+		// No storage prefix (bare volume name).
+		{"bare block name", "vm-100-disk-0", "raw", true},
+		// Unrecognized extension -> caller falls back to the storage lookup.
+		{"unknown extension", "local:100/vm-100-disk-0.foobar", "", false},
+		// subvol is an LXC container format (parse_name_dir), never a VM disk.
+		{"subvol not a vm disk format", "local:subvol-100-disk-0.subvol", "", false},
+		// Degenerate volume IDs (no volume name) -> unknown, not a raw guess.
+		{"trailing colon", "local-lvm:", "", false},
+		{"empty", "", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			format, ok := diskFormatForVolumeID(tt.volumeID)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantFormat, format)
+		})
+	}
+}
+
+// FuzzDiskFormatForVolumeID asserts the helper's total-function contract over
+// arbitrary input: it never panics, the returned format is always one of the
+// schema-accepted values (or empty), and ok is true exactly when a format was
+// derived.
+func FuzzDiskFormatForVolumeID(f *testing.F) {
+	seeds := []string{
+		// Realistic volume IDs (block + file plugins).
+		"local-lvm:vm-100-disk-0",
+		"local-zfs:vm-100-disk-1",
+		"ceph:vm-100-disk-0",
+		"local-lvm:base-9000-disk-0",
+		"local-lvm:vm-100-disk-0.qcow2",
+		"local:100/vm-100-disk-0.qcow2",
+		"nfs:100/vm-100-disk-0.raw",
+		"store:100/vm-100-disk-0.vmdk",
+		"local:9000/base-9000-disk-0.qcow2",
+		"vm-100-disk-0",
+		"local:100/vm-100-disk-0.foobar",
+		"local:subvol-100-disk-0.subvol",
+		// Degenerate / adversarial shapes.
+		"",
+		":",
+		"local-lvm:",
+		"a:b:c.qcow2",
+		"vm.100.disk.qcow2",
+		"vm-100-disk-0.",
+		"local:100/",
+		"local:x.QCOW2",
+		"local:x.QcOw2",
+		"...",
+		"local:.qcow2",
+		"local:100\\vm.qcow2",
+		"local:vm\n.qcow2",
+		"local:\xff\xfe.qcow2", // invalid UTF-8
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	valid := map[string]struct{}{"": {}, "qcow2": {}, "raw": {}, "vmdk": {}}
+
+	f.Fuzz(func(t *testing.T, volumeID string) {
+		format, ok := diskFormatForVolumeID(volumeID)
+
+		if _, isValid := valid[format]; !isValid {
+			t.Fatalf("diskFormatForVolumeID(%q) returned format %q, want one of {\"\", qcow2, raw, vmdk}", volumeID, format)
+		}
+
+		if ok != (format != "") {
+			t.Fatalf("diskFormatForVolumeID(%q) = (%q, %v): ok must equal (format != \"\")", volumeID, format, ok)
+		}
+	})
+}
