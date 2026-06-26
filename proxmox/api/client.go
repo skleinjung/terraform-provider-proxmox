@@ -377,6 +377,10 @@ func validateResponseCode(res *http.Response) error {
 			return errors.Join(ErrResourceAlreadyExists, httpError)
 		}
 
+		if res.StatusCode == http.StatusForbidden {
+			return errors.Join(ErrPermissionDenied, httpError)
+		}
+
 		return httpError
 	}
 

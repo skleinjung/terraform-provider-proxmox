@@ -26,6 +26,9 @@ const ErrResourceDoesNotExist Error = "the requested resource does not exist"
 // ErrResourceAlreadyExists is returned when attempting to create a resource that already exists.
 const ErrResourceAlreadyExists Error = "the requested resource already exists"
 
+// ErrPermissionDenied is returned when the API token lacks the privilege required for a request.
+const ErrPermissionDenied Error = "permission denied"
+
 // HTTPError is a generic error type for HTTP errors.
 type HTTPError struct {
 	Code    int

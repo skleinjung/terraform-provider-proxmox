@@ -78,6 +78,11 @@ func TestClientDoRequest(t *testing.T) {
 			status:  "500 rbd error: rbd: error opening image vm-97854-disk-0: (2) No such file or directory",
 			wantErr: ErrResourceDoesNotExist,
 		},
+		{
+			name:    "permission denied - 403 status",
+			status:  "403 Permission check failed (/vms/100, VM.Config.Disk)",
+			wantErr: ErrPermissionDenied,
+		},
 	}
 
 	for _, tt := range tests {
@@ -125,4 +130,31 @@ func TestClientDoRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestForbiddenJoinsHTTPError verifies a 403 is mapped to ErrPermissionDenied while the
+// original *HTTPError stays reachable via errors.As, which 403 consumers rely on.
+func TestForbiddenJoinsHTTPError(t *testing.T) {
+	t.Parallel()
+
+	c := client{
+		conn: &Connection{
+			endpoint: "http://localhost",
+			httpClient: newTestClient(func(_ *http.Request) *http.Response {
+				return &http.Response{
+					Status:     "403 Permission check failed (/vms/100, VM.Config.Disk)",
+					StatusCode: http.StatusForbidden,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}
+			}),
+		},
+		auth: dummyAuthenticator{},
+	}
+
+	err := c.DoRequest(t.Context(), "POST", "any", nil, nil)
+	require.ErrorIs(t, err, ErrPermissionDenied)
+
+	var he *HTTPError
+	require.ErrorAs(t, err, &he)
+	require.Equal(t, http.StatusForbidden, he.Code)
 }
